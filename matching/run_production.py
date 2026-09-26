@@ -734,6 +734,11 @@ def main() -> None:
                 "retrieved_by_tfidf_combined",
                 "retrieved_by_tfidf_name",
                 "bm25_score", "bm25_rank",
+                # FAISS blocking internals — not model features
+                "retrieved_by_faiss",
+                "retrieved_by_exact_clean_name",
+                "retrieved_by_exact_clean_address",
+                "retrieved_by_exact_clean_text",
             })
             feature_cols = [
                 c for c in labeled_df.columns
@@ -816,6 +821,11 @@ def main() -> None:
                 "retrieved_by_tfidf_name",
                 # BM25 blocking internals (present when --skip-bm25 is off)
                 "bm25_score", "bm25_rank",
+                # FAISS blocking internals — not model features
+                "retrieved_by_faiss",
+                "retrieved_by_exact_clean_name",
+                "retrieved_by_exact_clean_address",
+                "retrieved_by_exact_clean_text",
             })
             feature_cols = [
                 c for c in labeled_df.columns

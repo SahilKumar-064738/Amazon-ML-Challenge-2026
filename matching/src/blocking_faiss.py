@@ -113,30 +113,28 @@ def _require_sentence_transformers():
 # ---------------------------------------------------------------------------
 
 def _build_embed_texts(df: pd.DataFrame) -> list[str]:
-    """Return the canonical embedding text for each row.
+    """Return the canonical embedding text for each row (vectorized, 24M-safe).
 
-    Uses ``clean_name + ' ' + clean_address`` when both columns are present
-    and non-empty; otherwise falls back to ``clean_text``.
-
-    The same function is called for both corpus (S2/S3) and query (S1) rows
-    so the representation is symmetric.
+    Uses ``clean_name + ' ' + clean_address`` when both columns present;
+    otherwise falls back to ``clean_text``.
     """
     has_name    = "clean_name"    in df.columns
     has_address = "clean_address" in df.columns
     has_text    = "clean_text"    in df.columns
 
-    texts: list[str] = []
-    for row in df.itertuples(index=False):
-        name    = (getattr(row, "clean_name",    "") or "") if has_name    else ""
-        address = (getattr(row, "clean_address", "") or "") if has_address else ""
-        combined = f"{name} {address}".strip()
-        if combined:
-            texts.append(combined)
-        elif has_text:
-            texts.append(str(getattr(row, "clean_text", "") or ""))
-        else:
-            texts.append("")
-    return texts
+    if has_name and has_address:
+        names     = df["clean_name"].fillna("").astype(str).str.strip()
+        addresses = df["clean_address"].fillna("").astype(str).str.strip()
+        combined  = (names + " " + addresses).str.strip()
+        # Fall back to clean_text for rows where both name and address are empty
+        if has_text:
+            fallback = df["clean_text"].fillna("").astype(str).str.strip()
+            combined = combined.where(combined != "", fallback)
+        return combined.tolist()
+    elif has_text:
+        return df["clean_text"].fillna("").astype(str).str.strip().tolist()
+    else:
+        return [""] * len(df)
 
 
 # ---------------------------------------------------------------------------
