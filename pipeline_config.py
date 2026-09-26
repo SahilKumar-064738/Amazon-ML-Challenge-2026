@@ -136,9 +136,70 @@ def apply_threading_env(n_workers: int = DEFAULT_WORKERS) -> None:
         os.environ.setdefault(var, thread_str)
 
 # ---------------------------------------------------------------------------
-# Pipeline version
+# FAISS semantic retrieval configuration
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION: str = "1.0.0"
+# Embedding model — intfloat/multilingual-e5-small is a lightweight (117 MB)
+# multilingual sentence-transformers model that produces 384-d embeddings.
+# It runs on CPU without any GPU dependency.  All FAISS code reads this
+# constant; do NOT hardcode the model name elsewhere.
+FAISS_EMBEDDING_MODEL: str = "intfloat/multilingual-e5-small"
+
+# Output dimension of the above model.  Used to pre-allocate FAISS index
+# structures and as part of cache-validity metadata.
+FAISS_EMBEDDING_DIM: int = 384
+
+# IVF nlist — number of Voronoi cells for the IVFFlat index.
+# For ~10 M vectors a value of 1024 gives a good speed/recall tradeoff.
+# For ~24 M vectors (S2+S3 combined) consider increasing to 4096 with
+# FAISS_NPROBE=64 for better recall at the cost of ~4× index-build time.
+# For small datasets (< nlist vectors) the code automatically falls back to
+# IndexFlatIP (exact search) so this constant is safe for any dataset size.
+FAISS_NLIST: int = 1_024
+
+# Number of cells to probe at query time.  Higher → better recall, slower.
+# At nlist=1024: nprobe=16 → ~1.6% cells probed, recall typically >90%.
+# At nlist=4096 for 24M: use nprobe=64 for comparable recall.
+FAISS_NPROBE: int = 16
+
+# Normalization strategy: "l2" → L2-normalize embeddings before indexing/
+# querying, turning inner-product into cosine similarity.
+FAISS_NORMALIZATION: str = "l2"
+
+# Index type tag written to metadata sidecar for cache-invalidation checks.
+FAISS_INDEX_TYPE: str = "IVFFlat_IP"
+
+# Default top-K for FAISS retrieval.  Overridable via --top-k CLI flag.
+FAISS_TOP_K: int = DEFAULT_TOP_K  # mirrors the global blocking top-k (50)
+
+# Sentence-transformers encoding batch size.  Keep conservative to avoid
+# OOM on large corpora; overridable via --faiss-batch-size.
+FAISS_BATCH_SIZE: int = 1_000
+
+# Chunk size for adding vectors to the index in build_faiss_index().
+# 500 k vectors per chunk × 384 dims × 4 bytes ≈ 768 MB peak per chunk,
+# which is safe on a 128 GB machine while avoiding an all-at-once allocation.
+FAISS_ADD_CHUNK_SIZE: int = 500_000
+
+# ---------------------------------------------------------------------------
+# FAISS index + metadata paths (under the matching checkpoint directory)
+# ---------------------------------------------------------------------------
+# The index is split into two files:
+#   <base>.idx          — FAISS index metadata (written by faiss.write_index)
+#   <base>.idx.ivfdata  — on-disk inverted lists (OnDiskInvertedLists)
+#   <base>_metadata.json — cache-validity sidecar
+#
+# One index per split label (TRAIN / TEST) lives under the matching
+# checkpoint directory so it participates in the normal checkpoint lifecycle.
+
+def faiss_index_base(checkpoint_dir: "Path | str", split_label: str) -> Path:
+    """Return the base path for a FAISS index (without extension).
+
+    Files written:
+        <base>.idx
+        <base>.idx.ivfdata
+        <base>_metadata.json
+    """
+    return Path(checkpoint_dir) / f"faiss_index_{split_label.upper()}"
 
 def get_git_sha() -> str:
     """Return the current git commit SHA (short), or 'unknown' if unavailable."""
@@ -156,3 +217,9 @@ def get_git_sha() -> str:
     except Exception:
         pass
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline version
+# ---------------------------------------------------------------------------
+PIPELINE_VERSION: str = "1.0.0"

@@ -160,6 +160,17 @@ def _parse_args() -> argparse.Namespace:
         help="Batch size for FAISS sentence-transformers encoding (default: 1000).",
     )
     p.add_argument(
+        "--enable-faiss",
+        action="store_true",
+        help=(
+            "Enable FAISS semantic retrieval. Requires faiss-cpu and "
+            "sentence-transformers to be installed (see requirements.txt). "
+            "The index is built automatically on first run and reused on "
+            "subsequent runs unless the corpus or configuration changes. "
+            "FAISS is OFF by default; set this flag to activate it."
+        ),
+    )
+    p.add_argument(
         "--neg-ratio",
         type=int,
         default=5,
@@ -324,9 +335,17 @@ def run_blocking(s1_df: pd.DataFrame,
                  vectorizers: dict,
                  top_k: int,
                  label: str = "",
-                 skip_bm25: bool = False) -> tuple[pd.DataFrame, dict]:
+                 skip_bm25: bool = False,
+                 skip_faiss: bool = True) -> tuple[pd.DataFrame, dict]:
     """
-    Run the new master retrieval pipeline: Exact Match + Multi-View TF-IDF + FAISS + BM25, then fuse.
+    Run the master retrieval pipeline: Exact Match + Multi-View TF-IDF + FAISS + BM25, then fuse.
+
+    Parameters
+    ----------
+    skip_faiss : bool
+        When True (default) FAISS is not executed, preserving the existing
+        baseline behaviour.  Set to False only when --enable-faiss is passed.
+
     Returns (results_df, candidates_by_s1 dict).
     """
     s1_ids   = s1_df["entity_id"].tolist()
@@ -359,20 +378,34 @@ def run_blocking(s1_df: pd.DataFrame,
         mv_df = pd.DataFrame()
 
     # ── 3. FAISS SEMANTIC ──────────────
-    print(f"  [{label}] FAISS Semantic Retrieval (top_k={top_k}) ...")
-    try:
-        from src.blocking_faiss import search_faiss_candidates
-        faiss_idx_path = os.path.join(CKPT, f"faiss_index_{label}.idx")
-        # Ensure index exists, assuming it was built in step 2
-        if os.path.exists(faiss_idx_path) or os.path.exists(faiss_idx_path + ".ivfdata"):
-            faiss_df = search_faiss_candidates(s1_df, s2s3_df, faiss_idx_path, top_k=top_k, batch_size=ARGS.faiss_batch_size)
-            print(f"    FAISS pairs: {len(faiss_df)}")
+    faiss_df = pd.DataFrame()
+    if skip_faiss:
+        print(f"  [{label}] FAISS skipped (not enabled; use --enable-faiss to activate).")
+    else:
+        print(f"  [{label}] FAISS Semantic Retrieval (top_k={top_k}) ...")
+        # Import here — raises RuntimeError with actionable message if
+        # faiss-cpu or sentence-transformers are not installed.
+        from src.blocking_faiss import get_or_build_and_search
+        try:
+            from pipeline_config import faiss_index_base, FAISS_BATCH_SIZE, FAISS_ADD_CHUNK_SIZE
+        except ImportError:
+            # Fallback: infer base from checkpoint dir
+            faiss_index_base_fn = lambda ckpt, lbl: os.path.join(ckpt, f"faiss_index_{lbl}")
+            FAISS_BATCH_SIZE = ARGS.faiss_batch_size
+            FAISS_ADD_CHUNK_SIZE = 500_000
+            idx_base = faiss_index_base_fn(CKPT, label.upper())
         else:
-            print(f"    FAISS skipped (index not found).")
-            faiss_df = pd.DataFrame()
-    except ImportError:
-        print(f"    FAISS skipped (module missing).")
-        faiss_df = pd.DataFrame()
+            idx_base = str(faiss_index_base(CKPT, label))
+
+        faiss_df = get_or_build_and_search(
+            s2s3_df      = s2s3_df,
+            s1_df        = s1_df,
+            index_base   = idx_base,
+            split_label  = label.upper(),
+            top_k        = top_k,
+            batch_size   = ARGS.faiss_batch_size,
+        )
+        print(f"    FAISS pairs: {len(faiss_df)}")
         
     # ── 4. BM25 ──────────────
     bm25_df = pd.DataFrame()
@@ -439,17 +472,21 @@ def run_blocking(s1_df: pd.DataFrame,
             results_df["retrieved_by_bm25"] = 0
 
         # --- retrieval_agreement_count ---
-        # fuse_candidates() already computes this from all retrieved_by_* columns
-        # present at fusion time. Now that we've added the two alias columns,
-        # recompute so the count reflects the canonical pair of flags expected
-        # by downstream code (retrieved_by_char_tfidf + retrieved_by_bm25).
-        # We keep the fuse_candidates value if it's already there; only
-        # recompute if it's absent (defensive).
-        if "retrieval_agreement_count" not in results_df.columns:
-            results_df["retrieval_agreement_count"] = (
-                results_df["retrieved_by_char_tfidf"] +
-                results_df["retrieved_by_bm25"]
-            )
+        # Always recompute AFTER the alias columns are set so the count
+        # reflects the canonical (retrieved_by_char_tfidf + retrieved_by_bm25)
+        # pair, not whatever fuse_candidates computed from the raw retrieved_by_*
+        # flags (which may not have included the aliases yet).
+        #
+        # Clamp minimum to 1: build_feature_matrix() validates {1, 2}.
+        # A pair retrieved only by FAISS or exact-match (both canonical flags=0)
+        # would produce 0, which fails the validator.  Such pairs genuinely
+        # entered the candidate set (via another retrieval mechanism) so
+        # defaulting to 1 is conservative and correct.
+        raw_count = (
+            results_df["retrieved_by_char_tfidf"].astype(int)
+            + results_df["retrieved_by_bm25"].astype(int)
+        )
+        results_df["retrieval_agreement_count"] = raw_count.clip(lower=1)
 
     candidates_by_s1: dict[str, list[str]] = {}
     if not results_df.empty:
@@ -516,7 +553,7 @@ def build_features(cand_pairs_df: pd.DataFrame,
 def main() -> None:
     print(SEP)
     print("Production Pipeline — Business Entity Resolution")
-    print(f"  split={ARGS.split}  top_k={TOP_K}  skip_bm25={ARGS.skip_bm25}")
+    print(f"  split={ARGS.split}  top_k={TOP_K}  skip_bm25={ARGS.skip_bm25}  enable_faiss={ARGS.enable_faiss}")
     print(f"  force={ARGS.force}  checkpoint_dir={CKPT}")
     print(f"  features={'V2 (15)' if _USE_V2 else 'V1 (10)'}")
     print(SEP)
@@ -644,6 +681,7 @@ def main() -> None:
                 s1_train, s2s3_train, vectorizer,
                 top_k=TOP_K, label="TRAIN",
                 skip_bm25=ARGS.skip_bm25,
+                skip_faiss=not ARGS.enable_faiss,
             )
             # Persist
             train_results_df.to_csv(CKPT_TRAIN_RESULTS, sep="\t", index=False)
@@ -996,6 +1034,7 @@ def main() -> None:
             s1_test, s2s3_test, vectorizer,
             top_k=TOP_K, label="TEST",
             skip_bm25=ARGS.skip_bm25,
+            skip_faiss=not ARGS.enable_faiss,
         )
         test_results_df.to_csv(CKPT_TEST_RESULTS, sep="\t", index=False)
         write_candidate_pairs(test_candidates, CKPT_TEST_CAND)

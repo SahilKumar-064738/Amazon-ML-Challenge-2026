@@ -42,9 +42,15 @@ pytest-timeout>=2.1
 # ---------------------------------------------------------------------------
 # NOT included (intentionally excluded):
 #   boto3, sagemaker — AWS/SageMaker execution not required for GCP/local run
-#   faiss-cpu        — optional; install manually if FAISS blocking is needed:
-#                        pip install faiss-cpu>=1.7.4
-#   sentence-transformers — optional; install manually if FAISS semantic
-#                           blocking is needed:
-#                        pip install sentence-transformers>=2.2.2
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# FAISS semantic retrieval — CPU-only, no GPU required.
+# Only used when --enable-faiss is passed to run_pipeline.py.
+# Both packages are listed here so a fresh GCP/CI machine can install them
+# with a single  pip install -r requirements.txt  without any manual step.
+# Pinned to ranges that are compatible with the numpy<2.0 / pandas<3.0
+# environment above and tested on Ubuntu 22.04 / Python 3.10+.
+# ---------------------------------------------------------------------------
+faiss-cpu>=1.7.4,<2.0
+sentence-transformers>=2.2.2,<3.0

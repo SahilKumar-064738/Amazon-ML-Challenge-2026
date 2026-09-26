@@ -159,6 +159,16 @@ def _build_parser() -> argparse.ArgumentParser:
              "Recommended for machines with <= 32 GB RAM.",
     )
     p.add_argument(
+        "--enable-faiss",
+        action="store_true",
+        help=(
+            "Enable FAISS semantic retrieval in the matching stage. "
+            "Requires faiss-cpu and sentence-transformers (both included in "
+            "requirements.txt). The FAISS index is built automatically on "
+            "first run and reused when unchanged. FAISS is OFF by default."
+        ),
+    )
+    p.add_argument(
         "--splits", nargs="+", default=["train", "test"],
         choices=["train", "test"],
         help="Which splits to process (default: train test).",
@@ -258,6 +268,7 @@ def _run_matching(
     top_k: int,
     neg_ratio: int,
     skip_bm25: bool,
+    enable_faiss: bool,
     splits: list[str],
     force: bool,
     log,
@@ -300,6 +311,8 @@ def _run_matching(
     ]
     if skip_bm25:
         matching_argv.append("--skip-bm25")
+    if enable_faiss:
+        matching_argv.append("--enable-faiss")
     if force:
         matching_argv.append("--force")
 
@@ -386,6 +399,7 @@ def main() -> int:
     log.info("  Workers      : %d", workers)
     log.info("  Top-k        : %d", args.top_k)
     log.info("  BM25         : %s", "disabled" if args.skip_bm25 else "enabled")
+    log.info("  FAISS        : %s", "enabled"  if args.enable_faiss else "disabled")
     log.info("  Log file     : %s", log_path)
     log.info("=" * 60)
 
@@ -407,6 +421,7 @@ def main() -> int:
             "chunk_size":     args.chunk_size,
             "neg_ratio":      args.neg_ratio,
             "skip_bm25":      args.skip_bm25,
+            "enable_faiss":   args.enable_faiss,
             "splits":         args.splits,
         },
         "stages": {},
@@ -555,6 +570,7 @@ def main() -> int:
                 top_k=args.top_k,
                 neg_ratio=args.neg_ratio,
                 skip_bm25=args.skip_bm25,
+                enable_faiss=args.enable_faiss,
                 splits=args.splits,
                 force=args.force,
                 log=log,

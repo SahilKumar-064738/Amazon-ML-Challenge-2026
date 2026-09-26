@@ -1,5 +1,12 @@
 import pandas as pd
 
+# Columns that contribute to retrieval_agreement_count.
+# IMPORTANT: retrieved_by_faiss is intentionally excluded here.
+# features.build_feature_matrix() validates retrieval_agreement_count
+# strictly as {1, 2}.  FAISS is a third retrieval source but its provenance
+# flag is informational only and must not inflate the agreement count.
+_AGREEMENT_COLS = {"retrieved_by_char_tfidf", "retrieved_by_bm25"}
+
 def fuse_candidates(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     """
     Fuses multiple candidate DataFrames.
@@ -26,11 +33,21 @@ def fuse_candidates(dfs: list[pd.DataFrame]) -> pd.DataFrame:
         )
         
         # Combine overlapping columns if any (e.g., if multiple dataframes have 'score')
-        for col in merged_df.columns:
+        for col in list(merged_df.columns):
             if col.endswith('_dup'):
                 orig_col = col[:-4]
-                # Keep max of scores, or fillna for missing
-                merged_df[orig_col] = merged_df[orig_col].fillna(merged_df[col])
+                if orig_col.startswith('retrieved_by_'):
+                    # For retrieval flags: logical OR (take max of 0/1 values)
+                    merged_df[orig_col] = (
+                        pd.to_numeric(merged_df[orig_col], errors="coerce").fillna(0)
+                        .combine(
+                            pd.to_numeric(merged_df[col], errors="coerce").fillna(0),
+                            max
+                        )
+                    )
+                else:
+                    # For scores / other columns: keep original, fill NaN from dup
+                    merged_df[orig_col] = merged_df[orig_col].fillna(merged_df[col])
                 merged_df = merged_df.drop(columns=[col])
                 
     # Fill NaN for retrieval flags with 0.
@@ -45,8 +62,19 @@ def fuse_candidates(dfs: list[pd.DataFrame]) -> pd.DataFrame:
                 .astype(int)
             )
 
-    # Calculate retrieval agreement
-    retrieval_cols = [c for c in merged_df.columns if c.startswith('retrieved_by_')]
-    merged_df['retrieval_agreement_count'] = merged_df[retrieval_cols].sum(axis=1)
-    
+    # Calculate retrieval agreement — counts only the two canonical sources
+    # (TF-IDF and BM25) so the value stays in {1, 2} as required by
+    # features.build_feature_matrix().  retrieved_by_faiss is carried through
+    # as an informational provenance column but does NOT affect the count.
+    agreement_cols = [
+        c for c in merged_df.columns
+        if c in _AGREEMENT_COLS
+    ]
+    if agreement_cols:
+        merged_df['retrieval_agreement_count'] = merged_df[agreement_cols].sum(axis=1)
+    else:
+        # Fallback: if neither canonical column is present yet (e.g. called
+        # before the alias step in run_blocking), default to 1.
+        merged_df['retrieval_agreement_count'] = 1
+
     return merged_df
