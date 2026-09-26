@@ -14,6 +14,9 @@ numpy>=1.24.0,<2.0
 # Preprocessing (MLnNor) dependencies
 # ---------------------------------------------------------------------------
 # pandas and numpy above cover all preprocessing needs.
+# pyarrow is optional: enables Parquet TSV caching in scripts/prepare_data.py
+# for faster repeat preprocessing runs.  If absent, plain pd.read_csv is used.
+pyarrow>=14.0
 # scipy and scikit-learn are needed by matching/src/matching.py prototype
 # (not the production path) but listed here for completeness.
 

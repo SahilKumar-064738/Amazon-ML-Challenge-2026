@@ -30,7 +30,20 @@ GT_MATCH_PATTERN = r"^S[23]-\d+$"
 # ---------------------------------------------------------------------------
 # Whole-field NA-like tokens (business_name). Matched case-insensitively
 # after stripping whitespace.
-NA_LIKE_TOKENS = {"na", "n/a", "null", "none", "nan", "<null>", "<na>"}
+#
+# Extended set (production upgrade):
+#   n.a.        — dot-separated variant of N/A
+#   nil         — common in South Asian data entry
+#   not available / not applicable — verbose variants
+#   unknown     — explicit unknown-marker seen in real export files
+#   -           — a lone hyphen used as a placeholder
+#   –  —        — en-dash / em-dash as a placeholder (unicode variants)
+NA_LIKE_TOKENS = {
+    "na", "n/a", "null", "none", "nan", "<null>", "<na>",
+    # --- production additions ---
+    "n.a.", "nil", "not available", "not applicable", "unknown",
+    "-", "\u2013", "\u2014",   # lone hyphen, en-dash, em-dash
+}
 
 # ---------------------------------------------------------------------------
 # Business-name legal-suffix canonicalization
@@ -90,6 +103,26 @@ LEGAL_SUFFIX_MAP = {
     "s.c.i": "sci",
     "sa": "sa",
     "s.a": "sa",
+    # --- US additions (production upgrade) ---
+    # lp  = limited partnership
+    "lp":  "lp",
+    "l.p": "lp",
+    # lc  = limited company (some US states)
+    "lc":  "lc",
+    "l.c": "lc",
+    # pa  = professional association
+    "pa":  "pa",
+    "p.a": "pa",
+    # --- French additions (production upgrade) ---
+    # eurl = entreprise unipersonnelle à responsabilité limitée
+    "eurl":    "eurl",
+    "e.u.r.l": "eurl",
+    # snc  = société en nom collectif
+    "snc":   "snc",
+    "s.n.c": "snc",
+    # gie  = groupement d'intérêt économique
+    "gie":   "gie",
+    "g.i.e": "gie",
 }
 
 # ---------------------------------------------------------------------------
@@ -130,6 +163,28 @@ ADDRESS_ABBREV_MAP = {
     "hwy":  "highway",
     "pkwy": "parkway",
     "sq":   "square",
+    # --- US additions (production upgrade) ---
+    "expy": "expressway",
+    "fwy":  "freeway",
+    "tpke": "turnpike",
+    "tpk":  "turnpike",
+    "xing": "crossing",
+    "crk":  "creek",
+    "spg":  "spring",
+    "spgs": "springs",
+    # --- French additions (production upgrade) ---
+    # "bd" = boulevard in French addresses (e.g. "bd haussmann")
+    "bd":   "boulevard",
+    # "all" = allée (alley/path) — safe; no English word "all" appears as a
+    # standalone address-type token in these sources.
+    "all":  "allee",
+    # "imp" = impasse (dead-end street)
+    "imp":  "impasse",
+    # "res" = résidence (residential complex)
+    "res":  "residence",
+    # --- India additions (production upgrade) ---
+    # "sec" = sector — common in Chandigarh/Noida/Gurugram addresses
+    "sec":  "sector",
 }
 
 # Landmark prefixes (word-boundary matched — see normalization.py). Order

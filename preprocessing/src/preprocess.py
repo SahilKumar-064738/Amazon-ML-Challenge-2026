@@ -36,6 +36,48 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Optional Parquet-cache import.
+# scripts/prepare_data.py is not part of the src/ package, so we attempt a
+# sys.path-relative import.  If it fails for any reason (running inside a
+# SageMaker container where scripts/ is absent, pyarrow not installed, etc.)
+# we set the flag to False and fall back to plain pd.read_csv — the pipeline
+# is fully functional either way.
+# ---------------------------------------------------------------------------
+try:
+    import importlib.util as _ilu
+    import os as _os
+
+    _scripts_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "scripts")
+    _spec = _ilu.spec_from_file_location(
+        "prepare_data",
+        _os.path.join(_scripts_dir, "prepare_data.py"),
+    )
+    if _spec is not None and _spec.loader is not None:
+        _prepare_data = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_prepare_data)  # type: ignore[union-attr]
+        _load_tsv_cached = _prepare_data.load_tsv_cached
+        _CACHE_AVAILABLE = True
+    else:
+        _CACHE_AVAILABLE = False
+        _load_tsv_cached = None  # type: ignore[assignment]
+except Exception:  # noqa: BLE001
+    _CACHE_AVAILABLE = False
+    _load_tsv_cached = None  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# Optional Indic transliterator — loaded at main() time when --indic-dict is
+# passed, or when INDIC_DICT env var is set.  Never required at import time.
+# ---------------------------------------------------------------------------
+try:
+    from .normalization import set_transliterator as _set_transliterator
+    from .indic_transliteration import IndicTransliterator as _IndicTransliterator
+    _INDIC_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _set_transliterator = None   # type: ignore[assignment]
+    _IndicTransliterator = None  # type: ignore[assignment]
+    _INDIC_AVAILABLE = False
+
 try:  # pragma: no cover - import shim for `python -m src.preprocess` vs SageMaker container
     from .config import (
         GT_COLUMNS,
@@ -118,13 +160,35 @@ except ImportError:  # running as a plain script (e.g. inside a SageMaker contai
     )
 
 
-def read_tsv(path: Path) -> pd.DataFrame:
+def read_tsv(path: Path, cache_dir: Optional[Path] = None) -> pd.DataFrame:
     """Read a TSV with explicit dtype=str and no NaN coercion, per spec.
 
     keep_default_na=False + na_values=[] together ensure pandas never turns
     a literal "NA"/"NULL" cell into a real NaN — missing-value handling is
     done explicitly in normalization.py instead.
+
+    When ``scripts/prepare_data.py`` is importable and pyarrow is installed,
+    this function transparently serves the DataFrame from a Snappy-compressed
+    Parquet cache (keyed by SHA-256 of the source file).  On the very first
+    call the cache is written; every subsequent call skips TSV parsing
+    entirely.  If the cache layer is unavailable for any reason, the function
+    falls back to a direct ``pd.read_csv`` call — the returned DataFrame is
+    identical either way (all columns are ``object`` / ``str`` dtype, no
+    ``float NaN`` values).
+
+    Parameters
+    ----------
+    path:
+        Path to the raw ``.tsv`` file.
+    cache_dir:
+        Directory for Parquet cache files.  ``None`` (default) lets
+        ``load_tsv_cached`` choose a ``cache/`` sibling of ``path``'s
+        grandparent directory, which keeps the cache out of the input tree.
+        Pass an explicit path (e.g. from ``--cache-dir``) to override.
     """
+    if _CACHE_AVAILABLE:
+        return _load_tsv_cached(path, cache_dir=cache_dir)
+    # Fallback: plain read with the same strict NaN-prevention options.
     return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_values=[])
 
 
@@ -163,7 +227,12 @@ def clean_source(df: pd.DataFrame, source_key: str, name: str) -> "tuple[pd.Data
     out["country"] = df["country"]
     out["country_normalized"] = normalize_country_series(df["country"])
 
-    out["name_script_class"] = classify_name_script_series(name_normalized)
+    # name_script_class is computed from the RAW business_name column (not from
+    # name_normalized). This is intentional: after Indic transliteration the
+    # normalized form would be all-Latin even for a Devanagari input, so the
+    # script classification must reflect the ORIGINAL script seen in the source
+    # data, not the post-transliteration form.
+    out["name_script_class"] = classify_name_script_series(df["business_name"].fillna(""))
 
     out = out[REQUIRED_OUTPUT_COLUMNS]
 
@@ -241,6 +310,7 @@ def run(
     output_processed_dir: Path,
     output_metadata_dir: Path,
     splits: List[str],
+    cache_dir: Optional[Path] = None,
 ) -> Dict:
     output_processed_dir.mkdir(parents=True, exist_ok=True)
     output_metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -259,9 +329,9 @@ def run(
         split_out.mkdir(parents=True, exist_ok=True)
         split_report: Dict = {}
 
-        s1 = read_tsv(files["source1"])
-        s2 = read_tsv(files["source2"])
-        s3 = read_tsv(files["source3"])
+        s1 = read_tsv(files["source1"], cache_dir)
+        s2 = read_tsv(files["source2"], cache_dir)
+        s3 = read_tsv(files["source3"], cache_dir)
 
         s1_clean, s1_stats = clean_source(s1, "source1", f"{split}/source1")
         del s1  # free the raw frame before processing the next source (Section 11)
@@ -293,7 +363,7 @@ def run(
         })
 
         if split == TRAIN_SPLIT:
-            gt = read_tsv(files["ground_truth"])
+            gt = read_tsv(files["ground_truth"], cache_dir)
             gt_clean, gt_stats = clean_ground_truth(
                 gt,
                 set(s1_clean["entity_id"]),
@@ -356,6 +426,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=[TRAIN_SPLIT, TEST_SPLIT],
         help="Which splits to process (default: both train and test).",
     )
+    parser.add_argument(
+        "--cache-dir", default=None,
+        help=(
+            "Directory for Parquet cache files (speeds up repeat runs by "
+            "skipping TSV parsing).  Defaults to a 'cache/' subdirectory "
+            "next to --input-dir.  Has no effect if pyarrow is not installed "
+            "or scripts/prepare_data.py is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--indic-dict", default=None, metavar="PATH",
+        help=(
+            "Path to a JSON file produced by DictionaryLearner.save_dictionary() "
+            "or IndicTransliterator.save_dictionary().  When supplied, Indic-script "
+            "business names are transliterated to Latin phonetics before the rest of "
+            "normalization runs.  Has no effect when --no-transliterate is also given."
+        ),
+    )
+    parser.add_argument(
+        "--no-transliterate", action="store_true",
+        help=(
+            "Disable Indic transliteration entirely, even if --indic-dict is given.  "
+            "Useful for ablation experiments."
+        ),
+    )
     return parser
 
 
@@ -374,12 +469,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir / "metadata"
     )
 
+    # ── Indic transliterator setup ─────────────────────────────────────────
+    no_translit = getattr(args, "no_transliterate", False)
+    indic_dict_path = getattr(args, "indic_dict", None)
+    if _INDIC_AVAILABLE and not no_translit:
+        if indic_dict_path:
+            dict_path = Path(indic_dict_path)
+            if not dict_path.exists():
+                print(
+                    f"ERROR: --indic-dict path not found: {dict_path}",
+                    file=sys.stderr,
+                )
+                return 1
+            transliterator = _IndicTransliterator.load(dict_path)  # type: ignore[union-attr]
+            _set_transliterator(transliterator)  # type: ignore[misc]
+            print(f"Indic transliterator loaded from {dict_path} "
+                  f"({len(transliterator.get_dictionary())} dictionary entries)")
+        else:
+            # No dictionary file → use character-level transliteration only
+            _set_transliterator(_IndicTransliterator())  # type: ignore[misc]
+
     try:
         report = run(
             Path(args.input_dir),
             output_processed_dir,
             output_metadata_dir,
             args.splits,
+            cache_dir=Path(args.cache_dir) if getattr(args, "cache_dir", None) else None,
         )
     except FatalValidationError as e:
         print(str(e), file=sys.stderr)

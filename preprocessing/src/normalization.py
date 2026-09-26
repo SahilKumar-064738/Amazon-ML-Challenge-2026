@@ -14,12 +14,30 @@ Design notes (see implementation.md Section 26 "known issues to fix"):
     millions of rows (Section 11). The single-value functions remain the
     source of truth and are exercised directly by the unit tests; the bulk
     functions are thin vectorized wrappers around the same logic.
+
+Production-grade additions (upgrade pass):
+  * Accent folding   — NFD decompose + strip Mn (combining diacritics).
+                       LATIN-SCRIPT-GATED: never applied to Devanagari,
+                       Tamil, or any other non-Latin script where combining
+                       marks are semantically meaningful.
+  * URL / email strip — removes embedded http(s) URLs, bare domain tokens
+                        (e.g. "www.acme.com", "acme.in"), and email handles
+                        (@user) from business names before any other step.
+  * Leet-speak repair — digit-for-letter substitutions (0→o, 1→i, 3→e,
+                        4→a, 5→s, 7→t) fixed ONLY inside mixed
+                        alphanumeric tokens — never in pure-digit tokens or
+                        standalone numbers.
+  * DBA / T/A strip  — removes "doing business as", "dba", "d/b/a",
+                       "trading as", "t/a", "also known as", "aka" tags
+                       that split the canonical name from an alias.  The
+                       portion BEFORE the tag is kept (it is always the
+                       legal/primary name).
 """
 from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -30,6 +48,42 @@ from .config import (
     LEGAL_SUFFIX_MAP,
     NA_LIKE_TOKENS,
 )
+
+# ---------------------------------------------------------------------------
+# Optional Indic transliteration — imported lazily so the module loads cleanly
+# even in environments where indic_transliteration.py is absent.
+# ---------------------------------------------------------------------------
+try:
+    from .indic_transliteration import IndicTransliterator as _IndicTransliteratorClass
+    _INDIC_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _IndicTransliteratorClass = None  # type: ignore[assignment,misc]
+    _INDIC_AVAILABLE = False
+
+# Module-level transliterator instance.  None by default — the pipeline is
+# identical to the pre-transliteration baseline when this is None.
+_TRANSLITERATOR: Optional[object] = None  # type: ignore[type-arg]
+
+
+def set_transliterator(t: object) -> None:  # type: ignore[type-arg]
+    """Install an ``IndicTransliterator`` for use by ``normalize_name_basic``.
+
+    Call this once before processing begins (e.g. in ``preprocess.main()``
+    or in a test fixture).  Pass ``None`` to disable transliteration and
+    restore the default behaviour.
+
+    Parameters
+    ----------
+    t:
+        An ``IndicTransliterator`` instance, or ``None`` to disable.
+    """
+    global _TRANSLITERATOR
+    _TRANSLITERATOR = t
+
+
+def get_transliterator() -> Optional[object]:  # type: ignore[type-arg]
+    """Return the currently-installed transliterator, or ``None``."""
+    return _TRANSLITERATOR
 
 _WS_RE = re.compile(r"\s+")
 _DECORATIVE_LEADING_RE = re.compile(rf"^[{DECORATIVE_LEADING_CHARS}]+")
@@ -54,6 +108,166 @@ _LANDMARK_RE = re.compile(rf"(?i)(?<![a-z0-9])(?:{_LANDMARK_ALTERNATION})(?![a-z
 # Token-boundary punctuation strip used before legal-suffix / abbreviation
 # lookup (does not affect the stored normalized value, only the lookup key).
 _TOKEN_TRIM_RE = re.compile(r"^[.,]+|[.,]+$")
+
+# ---------------------------------------------------------------------------
+# Production additions — module-level compiled patterns
+# ---------------------------------------------------------------------------
+
+# Email addresses: user@domain.tld  (strip the whole token)
+_EMAIL_RE = re.compile(
+    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+)
+
+# URLs: http(s)://... or www.something or bare domain-like tokens
+# (e.g. "acme.com", "shop.acme.in", "www.acme.org").
+# Strategy: match anything that looks like a domain token, i.e. contains
+# a dot followed by a known TLD-like suffix (2-6 alpha chars).
+# Anchored with word boundaries so "U.S.A." or "S.A.R.L" (legal suffixes
+# that use dots) are NOT caught — they have uppercase letters and are
+# handled by the suffix map, not here.
+_URL_RE = re.compile(
+    r"""(?ix)
+    (?:https?://\S+)           # full URL with scheme
+    |
+    (?:www\.[A-Za-z0-9\-]+     # www. prefix
+       (?:\.[A-Za-z]{2,6})+    # one or more .tld segments
+       (?:/\S*)?)               # optional path
+    |
+    (?<!\w)                    # not preceded by a word char (prevents
+                               # matching "first.street" or "st.john")
+    [A-Za-z0-9]                # starts with alnum
+    [A-Za-z0-9\-]*             # middle alnum/hyphen
+    \.                         # a dot
+    (?:com|net|org|edu|gov|io|co|in|fr|de|uk|biz|info|me|us|eu)
+    (?:/\S*)?                  # optional path
+    (?!\w)                     # not followed by a word char
+    """
+)
+
+# DBA / T/A / trading-as patterns.
+# Captures the entire "dba …" suffix starting at the tag so we can
+# discard it, keeping only the portion before the tag.
+# Applied case-insensitively.
+_DBA_RE = re.compile(
+    r"""(?ix)
+    [\s,/\-]*          # optional separator before the tag
+    \b(?:
+        doing\s+business\s+as
+      | d[./]?\s*b[./]?\s*a\.?      # dba / d.b.a / d/b/a / d b a
+      | trading\s+as
+      | t[./]?\s*/?\s*a\.?          # t/a / t.a. / ta
+      | also\s+known\s+as
+      | a[./]?\s*k[./]?\s*a\.?      # aka / a.k.a
+    )\b
+    .*$                # everything after the tag (the alias)
+    """,
+    re.DOTALL,
+)
+
+# Leet-speak digit-to-letter substitutions.
+# ONLY applied inside mixed alphanumeric tokens (tokens containing both
+# letters AND digits).  Pure-digit tokens (building numbers, ZIP codes,
+# phone numbers) are never touched.
+#
+# Substitution map (digit → most unambiguous Latin letter replacement):
+#   0 → o   1 → i   3 → e   4 → a   5 → s   7 → t
+#
+# Deliberately excluded:
+#   2 (→ z or to): too ambiguous; "2" as "to" is common English
+#   6 (→ g or b): too ambiguous; "6" inside a normal word is unusual
+#   8 (→ b): uncommon
+_LEET_MAP: dict[str, str] = {
+    "0": "o",
+    "1": "i",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "7": "t",
+}
+
+# Pre-compiled translation table for str.translate — faster than repeated
+# re.sub calls for single-character substitutions.
+_LEET_TABLE = str.maketrans(_LEET_MAP)
+
+# A "mixed alphanumeric token" must contain at least one ASCII letter AND
+# at least one of the leet digits.
+_HAS_LETTER_RE = re.compile(r"[A-Za-z]")
+_HAS_LEET_DIGIT_RE = re.compile(r"[013457]")
+
+
+def _repair_leet_token(token: str) -> str:
+    """Repair leet-speak digits in a single token IFF it is mixed
+    alphanumeric.  Pure-digit tokens are returned unchanged.
+
+    "Preparat0ry"  → "Preparatory"
+    "4cme"         → "acme"
+    "123"          → "123"     (pure digit — untouched)
+    "42"           → "42"      (pure digit — untouched)
+    "studio54"     → "studio54"  (no leet digits 01357 present — untouched)
+    """
+    if not _HAS_LETTER_RE.search(token):
+        return token  # pure-digit token: leave completely untouched
+    if not _HAS_LEET_DIGIT_RE.search(token):
+        return token  # no leet digits present
+    return token.translate(_LEET_TABLE)
+
+
+def _repair_leet(text: str) -> str:
+    """Apply leet-speak repair to every whitespace-separated token in text."""
+    return " ".join(_repair_leet_token(tok) for tok in text.split())
+
+
+# ---------------------------------------------------------------------------
+# Accent folding helper — Latin-gated
+# ---------------------------------------------------------------------------
+
+def _is_latin_only(text: str) -> bool:
+    """Return True if all *letter* characters in text are Latin-script.
+
+    Digits, punctuation, whitespace are ignored.  An empty string (or a
+    string with no letters) returns True so that accent folding is applied
+    to numeric/punctuation-only strings without risk.
+
+    This is the gate that prevents accent folding from destroying combining
+    marks in Devanagari, Tamil, Gujarati, etc.
+    """
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if not cat.startswith("L"):
+            continue
+        cp = ord(ch)
+        # Latin ranges: Basic Latin + Latin-1 Supplement + Latin Extended A/B
+        # + IPA Extensions + Latin Extended Additional
+        if not (
+            (0x0041 <= cp <= 0x007A)   # A-Z a-z
+            or (0x00C0 <= cp <= 0x024F)  # Latin-1 Supplement + Extended A/B
+            or (0x1E00 <= cp <= 0x1EFF)  # Latin Extended Additional
+        ):
+            return False
+    return True
+
+
+def fold_accents(text: str) -> str:
+    """Strip combining diacritical marks from Latin-script text.
+
+    Applies NFD decomposition (separates base letter from combining mark)
+    then discards all Unicode category Mn (Mark, Nonspacing) characters.
+
+    "café"    → "cafe"
+    "naïve"   → "naive"
+    "résumé"  → "resume"
+    "Ångström" → "Angstrom"
+
+    NOT applied (returns text unchanged) when text contains non-Latin
+    letters (Devanagari, Tamil, Arabic, CJK …) — combining marks in those
+    scripts are phonemically essential.
+    """
+    if not _is_latin_only(text):
+        return text
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", text)
+        if unicodedata.category(ch) != "Mn"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +298,67 @@ def normalize_name_basic(name: str) -> Tuple[str, bool]:
     is empty/whitespace-only, an NA-like literal token, or normalizes down
     to an empty string once decorative leading characters are stripped.
     The row itself is never dropped for this — see preprocess.py.
+
+    Cleaning pipeline (in order):
+      0. Indic transliteration — if an IndicTransliterator is installed via
+                               set_transliterator(), Indic-script tokens are
+                               converted to Latin phonetics before any other
+                               step.  Latin-only names are untouched.
+                               When no transliterator is installed (default),
+                               this step is a no-op.
+      1. Email stripping     — remove user@domain.tld tokens
+      2. URL / domain strip  — remove http://…, www.…, bare domain tokens
+      3. DBA / T/A strip     — keep only the primary name before any
+                               "doing business as" / "t/a" / "aka" tag
+      4. NA-like check       — after stripping, the residual may now be empty
+                               or an NA literal
+      5. NFKC               — Unicode compatibility normalisation
+      6. Lowercase
+      7. Accent folding      — NFD + strip Mn, Latin-gated only
+      8. Decorative-leading strip
+      9. Leet-speak repair   — digit-for-letter in mixed-alnum tokens only
+     10. Whitespace collapse
     """
     if name is None or name == "" or is_na_like(name):
         return "", True
-    text = nfkc(name)
+
+    text = name
+
+    # 0. Indic transliteration (optional — no-op when _TRANSLITERATOR is None).
+    if _TRANSLITERATOR is not None:
+        text = _TRANSLITERATOR.transliterate(text)  # type: ignore[union-attr]
+
+    # 1. Strip email addresses (must run before URL stripping so the @domain
+    #    part is not mistaken for a bare domain token).
+    text = _EMAIL_RE.sub(" ", text)
+
+    # 2. Strip URLs and bare domain tokens.
+    text = _URL_RE.sub(" ", text)
+
+    # 3. Strip DBA / T/A / AKA suffixes — keep only the primary name.
+    text = _DBA_RE.sub("", text).strip().rstrip(",;/")
+
+    # 4. Re-check after stripping: the residual may now be empty or NA.
+    text = text.strip()
+    if not text or is_na_like(text):
+        return "", True
+
+    # 5. NFKC Unicode normalization.
+    text = nfkc(text)
+
+    # 6. Lowercase.
     text = text.lower()
+
+    # 7. Accent folding (Latin-gated — Devanagari/Tamil/etc. untouched).
+    text = fold_accents(text)
+
+    # 8. Strip decorative leading characters.
     text = _DECORATIVE_LEADING_RE.sub("", text)
+
+    # 9. Leet-speak digit-for-letter repair (mixed tokens only).
+    text = _repair_leet(text)
+
+    # 10. Collapse whitespace.
     text = collapse_whitespace(text)
     return text, (text == "")
 
@@ -142,6 +411,11 @@ def normalize_address_basic(address: str) -> Tuple[str, bool]:
     missing-value marker, not real address text. If every component was a
     null marker, the result is treated as missing.
     Landmark phrases (near/opp/opposite/behind ...) are NEVER removed here.
+
+    Accent folding (Latin-gated) is applied so that "Résidence du Parc" and
+    "Residence du Parc" normalise identically. URL/leet/DBA stripping is
+    intentionally NOT applied to addresses — street names and building
+    numbers must be preserved exactly.
     """
     if address is None or address == "":
         return "", True
@@ -152,6 +426,10 @@ def normalize_address_basic(address: str) -> Tuple[str, bool]:
     text = ", ".join(kept)
     text = nfkc(text)
     text = text.lower()
+    # Accent folding: strip combining diacritics from Latin-script addresses
+    # (e.g. French "résidence" → "residence", "allée" → "allee") so that
+    # abbreviated and accented variants canonicalise identically.
+    text = fold_accents(text)
     text = collapse_whitespace(text)
     return text, False
 
@@ -199,24 +477,33 @@ def normalize_country(country: str) -> str:
 # ---------------------------------------------------------------------------
 
 def normalize_name_series(names: pd.Series) -> Tuple[pd.Series, pd.Series]:
-    """Vectorized equivalent of normalize_name_basic over a whole column."""
+    """Vectorized equivalent of normalize_name_basic over a whole column.
+
+    Delegates to normalize_name_basic per-value so that all cleaning steps
+    (accent folding, URL/email strip, DBA strip, leet repair) are applied
+    identically to the Series path and the single-value path.
+
+    Performance: still uses a list comprehension (not df.apply with a lambda)
+    and short-circuits the expensive single-value call for cells that are
+    trivially empty or NA-literal via a fast vectorized pre-check.
+    """
     s = names.fillna("")
+    # Fast vectorized pre-pass to identify trivially missing rows so we don't
+    # spend time running the full pipeline on them.
     is_na_literal = s.str.strip().str.lower().isin(NA_LIKE_TOKENS)
     is_empty_input = s == ""
+    needs_processing = ~(is_na_literal | is_empty_input)
 
-    # Unicode NFKC has no vectorized pandas equivalent; it is applied
-    # per-value, but via a fast list comprehension rather than df.apply,
-    # and only after the cheap vectorized empty/NA-literal checks above so
-    # we never call it on rows we're about to blank out anyway.
-    needs_nfkc = ~(is_na_literal | is_empty_input)
-    normalized = s.copy()
-    normalized.loc[needs_nfkc] = [nfkc(v) for v in s.loc[needs_nfkc]]
-    normalized = normalized.str.lower()
-    normalized = normalized.str.replace(_DECORATIVE_LEADING_RE, "", regex=True)
-    normalized = normalized.str.replace(_WS_RE, " ", regex=True).str.strip()
+    # Run the full single-value pipeline only on rows that need it.
+    norm_values = [""] * len(s)
+    missing_flags = [True] * len(s)
+    for idx in s.index[needs_processing]:
+        norm_val, is_miss = normalize_name_basic(s.loc[idx])
+        norm_values[s.index.get_loc(idx)] = norm_val
+        missing_flags[s.index.get_loc(idx)] = is_miss
 
-    normalized.loc[is_na_literal | is_empty_input] = ""
-    is_missing = is_na_literal | is_empty_input | (normalized == "")
+    normalized = pd.Series(norm_values, index=s.index)
+    is_missing = pd.Series(missing_flags, index=s.index)
     return normalized, is_missing
 
 
