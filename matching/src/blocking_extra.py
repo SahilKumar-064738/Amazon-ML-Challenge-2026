@@ -781,12 +781,16 @@ def union_with_extra_channel(
         result = pd.concat([result, new_rows], ignore_index=True, sort=False)
 
     # Update agreement count
+    # pandas 3.x: flag columns may be StringDtype if the DataFrame passed through
+    # a TSV checkpoint; coerce to numeric before sum.
     flag_cols = [c for c in result.columns if c.startswith("retrieved_by_")]
     if flag_cols:
-        result["retrieval_agreement_count"] = result[flag_cols].fillna(0).astype(int).sum(axis=1)
+        for _fc in flag_cols:
+            result[_fc] = pd.to_numeric(result[_fc], errors="coerce").fillna(0).astype(int)
+        result["retrieval_agreement_count"] = result[flag_cols].sum(axis=1)
 
-    # Cast flag cols to int
+    # Cast flag cols to int (already done above, but keep for clarity)
     for col in flag_cols:
-        result[col] = result[col].fillna(0).astype(int)
+        result[col] = result[col].astype(int)
 
     return result.reset_index(drop=True)

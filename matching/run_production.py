@@ -468,7 +468,13 @@ def build_features(cand_pairs_df: pd.DataFrame,
                    feat_s2s3: pd.DataFrame,
                    scores_df: pd.DataFrame,
                    results_df: pd.DataFrame) -> pd.DataFrame:
-    """Build the full feature table from a candidate pair set."""
+    """Build the full feature table from a candidate pair set.
+
+    Mirrors the train-side feature construction exactly so that train and
+    test feature columns are always consistent.
+    """
+    from src.features_rich import add_rich_features
+
     pair_df = build_pair_table(cand_pairs_df, feat_s1, feat_s2s3, scores_df)
     pair_df = add_name_similarity_features(pair_df)
     pair_df = add_address_similarity_features(pair_df)
@@ -476,6 +482,30 @@ def build_features(cand_pairs_df: pd.DataFrame,
     if _USE_V2:
         pair_df = add_retrieval_agreement_features(pair_df, results_df)
         pair_df = add_length_features(pair_df)
+
+    # Add the same rich features that the train path adds via add_rich_features().
+    # These are computed from s1_name / s2_name / s1_address / s2_address which
+    # are derived from the feature TSV files.  We join them here the same way
+    # the train path does (pair_df already has s1_clean_name etc. from
+    # build_pair_table, so rename them to the expected s1_name/s2_name keys).
+    pair_df = pair_df.rename(columns={
+        "s1_clean_name":    "s1_name",
+        "candidate_clean_name": "s2_name",
+        "s1_clean_address": "s1_address",
+        "candidate_clean_address": "s2_address",
+    })
+    # Pass empty DataFrames for s1_df/s2s3_df since add_rich_features only
+    # uses pair_df columns (s1_name, s2_name, s1_address, s2_address).
+    pair_df = add_rich_features(pair_df,
+                                pd.DataFrame(columns=feat_s1.columns),
+                                pd.DataFrame(columns=feat_s2s3.columns))
+    # Restore canonical column names for downstream compatibility
+    pair_df = pair_df.rename(columns={
+        "s1_name":    "s1_clean_name",
+        "s2_name":    "candidate_clean_name",
+        "s1_address": "s1_clean_address",
+        "s2_address": "candidate_clean_address",
+    })
     return pair_df
 
 
@@ -567,9 +597,37 @@ def main() -> None:
             _skip("Training blocking")
             train_results_df = pd.read_csv(CKPT_TRAIN_RESULTS, sep="\t",
                                            dtype=str, keep_default_na=False)
-            train_results_df["cosine_similarity"] = train_results_df[
-                "cosine_similarity"].astype(float)
-            train_results_df["rank"] = train_results_df["rank"].astype(int)
+            # The checkpoint TSV stores the score under 'score' (from
+            # blocking_multiview) or 'cosine_similarity' depending on which
+            # blocking path ran.  Normalise to 'cosine_similarity' float here.
+            # pandas 3.x: columns loaded with dtype=str need explicit numeric
+            # coercion; .astype(float) on a StringDtype series also works but
+            # pd.to_numeric is more robust for missing/empty values.
+            if "cosine_similarity" not in train_results_df.columns:
+                score_src = "score" if "score" in train_results_df.columns else None
+                if score_src:
+                    train_results_df["cosine_similarity"] = pd.to_numeric(
+                        train_results_df[score_src], errors="coerce"
+                    ).fillna(0.0)
+                else:
+                    train_results_df["cosine_similarity"] = 0.0
+            else:
+                train_results_df["cosine_similarity"] = pd.to_numeric(
+                    train_results_df["cosine_similarity"], errors="coerce"
+                ).fillna(0.0)
+            if "rank" not in train_results_df.columns:
+                # Reconstruct rank as row-order within each S1 entity group
+                train_results_df["rank"] = (
+                    train_results_df
+                    .sort_values(["source1_entity_id", "cosine_similarity"],
+                                 ascending=[True, False])
+                    .groupby("source1_entity_id")
+                    .cumcount()
+                )
+            else:
+                train_results_df["rank"] = pd.to_numeric(
+                    train_results_df["rank"], errors="coerce"
+                ).fillna(0).astype(int)
             # Reconstruct candidates_by_s1 from saved TSV
             train_cand_raw = pd.read_csv(CKPT_TRAIN_CAND, sep="\t",
                                          dtype=str, keep_default_na=False)
@@ -598,13 +656,51 @@ def main() -> None:
             _mark_done(SENT_TRAIN_BLOCK)
             print(f"  Blocking done in {time.time()-t0:.1f}s")
 
+        # ── Normalise score column from blocking ─────────────────────────
+        # run_blocking() (and blocking_multiview) emits 'score'; the resume
+        # path may already have 'cosine_similarity'.  Ensure both a float
+        # 'cosine_similarity' and integer 'rank' column always exist in
+        # train_results_df before Step 4 uses it.
+        if "cosine_similarity" not in train_results_df.columns:
+            _sc = "score" if "score" in train_results_df.columns else None
+            train_results_df["cosine_similarity"] = (
+                pd.to_numeric(train_results_df[_sc], errors="coerce").fillna(0.0)
+                if _sc else 0.0
+            )
+        else:
+            train_results_df["cosine_similarity"] = pd.to_numeric(
+                train_results_df["cosine_similarity"], errors="coerce"
+            ).fillna(0.0)
+        if "rank" not in train_results_df.columns:
+            train_results_df["rank"] = (
+                train_results_df
+                .sort_values(["source1_entity_id", "cosine_similarity"],
+                             ascending=[True, False])
+                .groupby("source1_entity_id")
+                .cumcount()
+            )
+
         # ── Step 4: Training features ─────────────────────────────────────
         if _done(SENT_TRAIN_FEAT) and os.path.isfile(CKPT_TRAIN_LABELED):
             _skip("Training feature engineering")
             labeled_df = pd.read_csv(CKPT_TRAIN_LABELED, sep="\t",
                                      dtype=str, keep_default_na=False)
-            # Find feature columns generically
-            feature_cols = [c for c in labeled_df.columns if c not in ["source1_entity_id", "candidate_entity_id", "label", "is_match", "matching_entity_ids"]]
+            # Find feature columns — same exclusion list as the fresh-run path
+            _NON_FEATURE_COLS_RESUME = frozenset({
+                "source1_entity_id", "candidate_entity_id",
+                "label", "is_match", "matching_entity_ids",
+                "candidate_entity_ids",
+                "s1_name", "s2_name", "s1_address", "s2_address",
+                "score", "cosine_similarity", "rank",
+                "retrieved_by_tfidf_address",
+                "retrieved_by_tfidf_combined",
+                "retrieved_by_tfidf_name",
+                "bm25_score", "bm25_rank",
+            })
+            feature_cols = [
+                c for c in labeled_df.columns
+                if c not in _NON_FEATURE_COLS_RESUME
+            ]
             for col in feature_cols:
                 if col in labeled_df.columns:
                     labeled_df[col] = pd.to_numeric(labeled_df[col], errors='coerce')
@@ -646,8 +742,13 @@ def main() -> None:
             # Map 'is_match' to LABEL_COL
             labeled_df[LABEL_COL] = labeled_df['is_match']
             
-            # Ensure no NaNs in features
-            labeled_df.fillna(0, inplace=True)
+            # Ensure no NaNs in numeric feature columns.
+            # pandas 3.x uses a PyArrow-backed StringDtype for columns loaded
+            # with dtype=str; fillna(0) on those raises TypeError because 0 is
+            # not a valid string fill value.  We therefore restrict fillna to
+            # numeric columns only — string ID columns are never NaN here.
+            _num_cols = labeled_df.select_dtypes(include="number").columns
+            labeled_df[_num_cols] = labeled_df[_num_cols].fillna(0)
 
             n_pos = int((labeled_df[LABEL_COL] == 1).sum())
             n_neg = int((labeled_df[LABEL_COL] == 0).sum())
@@ -655,8 +756,33 @@ def main() -> None:
             print(f"  Labeled pairs: {len(labeled_df)}  (pos={n_pos}, neg={n_neg})")
 
             write_labeled_pairs(labeled_df, CKPT_TRAIN_LABELED)
-            # Save feature column list for test-side resume
-            feature_cols = [c for c in labeled_df.columns if c not in ["source1_entity_id", "candidate_entity_id", "label", "is_match", "matching_entity_ids", "s1_name", "s2_name", "s1_address", "s2_address", "candidate_entity_ids"]]
+            # Save feature column list for test-side resume.
+            # Exclude:
+            #  (a) ID / label columns that are never model features
+            #  (b) raw blocking passthrough columns that come from
+            #      train_results_df but are NOT produced by build_features()
+            #      (which is what generates test_pair_df).  Keeping them would
+            #      cause score_pairs() to fail with "column missing" on the
+            #      test side because build_features() never emits them.
+            _NON_FEATURE_COLS = frozenset({
+                # identity / label
+                "source1_entity_id", "candidate_entity_id",
+                "label", "is_match", "matching_entity_ids",
+                "candidate_entity_ids",
+                # rich-feature scratch columns (not model inputs)
+                "s1_name", "s2_name", "s1_address", "s2_address",
+                # raw blocking internals not emitted by build_features()
+                "score", "cosine_similarity", "rank",
+                "retrieved_by_tfidf_address",
+                "retrieved_by_tfidf_combined",
+                "retrieved_by_tfidf_name",
+                # BM25 blocking internals (present when --skip-bm25 is off)
+                "bm25_score", "bm25_rank",
+            })
+            feature_cols = [
+                c for c in labeled_df.columns
+                if c not in _NON_FEATURE_COLS
+            ]
             
             with open(CKPT_FEATURE_COLS, "w") as f:
                 f.write("\n".join(feature_cols))
@@ -829,9 +955,32 @@ def main() -> None:
         _skip("Test blocking")
         test_results_df = pd.read_csv(CKPT_TEST_RESULTS, sep="\t",
                                       dtype=str, keep_default_na=False)
-        test_results_df["cosine_similarity"] = test_results_df[
-            "cosine_similarity"].astype(float)
-        test_results_df["rank"] = test_results_df["rank"].astype(int)
+        # Same normalisation as the train-side resume: checkpoint may store
+        # 'score' instead of 'cosine_similarity', and 'rank' may be absent.
+        if "cosine_similarity" not in test_results_df.columns:
+            score_src = "score" if "score" in test_results_df.columns else None
+            if score_src:
+                test_results_df["cosine_similarity"] = pd.to_numeric(
+                    test_results_df[score_src], errors="coerce"
+                ).fillna(0.0)
+            else:
+                test_results_df["cosine_similarity"] = 0.0
+        else:
+            test_results_df["cosine_similarity"] = pd.to_numeric(
+                test_results_df["cosine_similarity"], errors="coerce"
+            ).fillna(0.0)
+        if "rank" not in test_results_df.columns:
+            test_results_df["rank"] = (
+                test_results_df
+                .sort_values(["source1_entity_id", "cosine_similarity"],
+                             ascending=[True, False])
+                .groupby("source1_entity_id")
+                .cumcount()
+            )
+        else:
+            test_results_df["rank"] = pd.to_numeric(
+                test_results_df["rank"], errors="coerce"
+            ).fillna(0).astype(int)
         test_cand_raw = pd.read_csv(CKPT_TEST_CAND, sep="\t",
                                     dtype=str, keep_default_na=False)
         test_candidates: dict[str, list[str]] = {}
@@ -855,6 +1004,28 @@ def main() -> None:
         _mark_done(SENT_TEST_BLOCK)
         print(f"  Test blocking done in {time.time()-t0:.1f}s")
 
+    # ── Normalise test blocking score column ────────────────────────────
+    # run_blocking() emits 'score'; ensure a float 'cosine_similarity' and
+    # integer 'rank' are always present before Step 8 uses them.
+    if "cosine_similarity" not in test_results_df.columns:
+        _sc = "score" if "score" in test_results_df.columns else None
+        test_results_df["cosine_similarity"] = (
+            pd.to_numeric(test_results_df[_sc], errors="coerce").fillna(0.0)
+            if _sc else 0.0
+        )
+    else:
+        test_results_df["cosine_similarity"] = pd.to_numeric(
+            test_results_df["cosine_similarity"], errors="coerce"
+        ).fillna(0.0)
+    if "rank" not in test_results_df.columns:
+        test_results_df["rank"] = (
+            test_results_df
+            .sort_values(["source1_entity_id", "cosine_similarity"],
+                         ascending=[True, False])
+            .groupby("source1_entity_id")
+            .cumcount()
+        )
+
     # Ensure candidate_pairs.tsv is always written (even on resume)
     if not os.path.isfile(O_CANDIDATE_PAIRS):
         write_candidate_pairs(test_candidates, O_CANDIDATE_PAIRS)
@@ -868,6 +1039,7 @@ def main() -> None:
     else:
         print("\n[STEP 8] Test feature engineering + scoring ...")
         t0 = time.time()
+        # cosine_similarity is now guaranteed to exist as float (normalised above)
         test_scores_df = test_results_df[
             ["source1_entity_id", "candidate_entity_id", "cosine_similarity"]
         ].copy()

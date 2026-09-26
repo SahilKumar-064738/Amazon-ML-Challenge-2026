@@ -47,7 +47,11 @@ def add_rich_features(pair_df: pd.DataFrame, s1_df: pd.DataFrame, s2s3_df: pd.Da
         pair_df['name_jaro_winkler'] = 0.0
         pair_df['addr_jaro_winkler'] = 0.0
 
-    pair_df.fillna(0, inplace=True)
+    # Fill NaN values in numeric columns only.
+    # pandas 3.x: fillna(0) on a StringDtype column raises TypeError because
+    # integer 0 is not a valid string.  Select only numeric columns to fill.
+    _num_cols = pair_df.select_dtypes(include="number").columns
+    pair_df[_num_cols] = pair_df[_num_cols].fillna(0)
     return pair_df
 
 def compute_top1_top2_margin(scored_df: pd.DataFrame) -> pd.DataFrame:

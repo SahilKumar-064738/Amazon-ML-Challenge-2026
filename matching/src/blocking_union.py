@@ -369,8 +369,11 @@ def union_three_channel_candidates(
             union_df[col] = np.nan
 
     # Cast flag columns to int (NaN from concat → 0)
+    # pandas 3.x: coerce to numeric first in case any column is StringDtype.
     for flag in ("retrieved_by_combined", "retrieved_by_name", "retrieved_by_address"):
-        union_df[flag] = union_df[flag].fillna(0).astype(int)
+        union_df[flag] = (
+            pd.to_numeric(union_df[flag], errors="coerce").fillna(0).astype(int)
+        )
 
     union_df["retrieval_agreement_count"] = (
         union_df["retrieved_by_combined"]

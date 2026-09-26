@@ -653,7 +653,10 @@ def log_candidate_stats(
                 score_col = cand
                 break
         if score_col is not None and len(results_df) > 0:
-            n_zero = int((results_df[score_col] <= 0.0).sum())
+            # pandas 3.x: score column may be StringDtype if loaded from TSV;
+            # coerce to numeric before comparison to avoid TypeError.
+            _score_num = pd.to_numeric(results_df[score_col], errors="coerce").fillna(0.0)
+            n_zero = int((_score_num <= 0.0).sum())
             pct_zero_score = round(100.0 * n_zero / len(results_df), 2)
 
     stats = {
@@ -1341,11 +1344,14 @@ def union_candidate_results(
     ).reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    # Cast retrieval flags to int (outer merge can introduce float NaN)
+    # Cast retrieval flags to int (outer merge can introduce float NaN).
+    # pandas 3.x: coerce to numeric first if any column is StringDtype.
     # ------------------------------------------------------------------
     for col in ("retrieved_by_char_tfidf", "retrieved_by_bm25",
                 "retrieval_agreement_count"):
-        merged[col] = merged[col].fillna(0).astype(int)
+        merged[col] = (
+            pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
+        )
 
     # Final column order
     final_cols = [

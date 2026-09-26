@@ -33,11 +33,18 @@ def fuse_candidates(dfs: list[pd.DataFrame]) -> pd.DataFrame:
                 merged_df[orig_col] = merged_df[orig_col].fillna(merged_df[col])
                 merged_df = merged_df.drop(columns=[col])
                 
-    # Fill NaN for retrieval flags with 0
+    # Fill NaN for retrieval flags with 0.
+    # pandas 3.x uses a PyArrow-backed StringDtype for columns originating from
+    # TSV reads with dtype=str.  We must coerce to numeric before fillna/astype
+    # to avoid "Invalid value '0' for dtype 'str'" TypeError.
     for col in merged_df.columns:
         if col.startswith('retrieved_by_'):
-            merged_df[col] = merged_df[col].fillna(0).astype(int)
-            
+            merged_df[col] = (
+                pd.to_numeric(merged_df[col], errors="coerce")
+                .fillna(0)
+                .astype(int)
+            )
+
     # Calculate retrieval agreement
     retrieval_cols = [c for c in merged_df.columns if c.startswith('retrieved_by_')]
     merged_df['retrieval_agreement_count'] = merged_df[retrieval_cols].sum(axis=1)
