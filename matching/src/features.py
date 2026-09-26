@@ -2068,8 +2068,88 @@ FEATURE_COLUMNS_V4: list[str] = FEATURE_COLUMNS_V3 + FREQUENCY_FEATURE_COLS
 #: V5 = V4 + 8 RRF/rank-aware features (40 total). Full feature set.
 FEATURE_COLUMNS_V5: list[str] = FEATURE_COLUMNS_V4 + RRF_FEATURE_COLS
 
+#: 15 difference features added in V6 (token diff + numeric diff).
+DIFF_FEATURE_COLS: list[str] = [
+    # Token difference — name
+    "name_common_token_count",
+    "name_s1_only_token_count",
+    "name_cand_only_token_count",
+    "name_token_difference_ratio",
+    "name_diff_token_sim",
+    # Token difference — address
+    "addr_common_token_count",
+    "addr_s1_only_token_count",
+    "addr_cand_only_token_count",
+    # Numeric difference
+    "numeric_common_count",
+    "numeric_s1_only_count",
+    "numeric_cand_only_count",
+    "numeric_overlap_ratio",
+    "numeric_conflict",
+    "numeric_set_equal",
+    "numeric_rel_diff",
+]
+
+#: V6 = V5 + 15 difference features (55 total).
+FEATURE_COLUMNS_V6: list[str] = FEATURE_COLUMNS_V5 + DIFF_FEATURE_COLS
+
+#: 16 runner-up margin and ambiguity/competition features added in V7.
+MARGIN_FEATURE_COLS: list[str] = [
+    "candidate_rank",
+    "top_candidate_score",
+    "second_candidate_score",
+    "top1_top2_margin",
+    "score_margin_vs_other",
+    "score_gap_to_next",
+    "score_gap_to_top",
+    "relative_margin",
+    "name_sim_margin",
+    "addr_sim_margin",
+    "candidate_count",
+    "n_near_ties",
+    "n_strong_candidates",
+    "candidates_within_01_of_top",
+    "competition_density",
+    "is_ambiguous_candidate_set",
+]
+
+#: V7 = V6 + 16 margin/ambiguity features (71 total).
+FEATURE_COLUMNS_V7: list[str] = FEATURE_COLUMNS_V6 + MARGIN_FEATURE_COLS
+
+#: 10 RapidFuzz similarity features added in V8.
+RAPIDFUZZ_FEATURE_COLS: list[str] = [
+    "name_fuzz_ratio",
+    "name_partial_ratio",
+    "name_key_ratio",
+    "name_key_partial_ratio",
+    "name_key_jaro_winkler",
+    "addr_fuzz_ratio",
+    "addr_partial_ratio",
+    "addr_token_sort_ratio",
+    "addr_token_set_ratio",
+    "addr_diff_token_sim",
+]
+
+#: V8 = V7 + 10 RapidFuzz features (81 total).
+FEATURE_COLUMNS_V8: list[str] = FEATURE_COLUMNS_V7 + RAPIDFUZZ_FEATURE_COLS
+
+#: 8 Indic transliteration features added in V9.
+TRANSLITERATION_FEATURE_COLS: list[str] = [
+    "translit_token_mapped_count",
+    "translit_token_mapped_ratio",
+    "translit_name_fuzz_ratio",
+    "translit_name_token_sort_ratio",
+    "translit_name_token_set_ratio",
+    "translit_similarity_gain",
+    "translit_addr_mapped_count",
+    "translit_addr_fuzz_ratio",
+]
+
+#: V9 = V8 + 8 transliteration features (89 total).
+FEATURE_COLUMNS_V9: list[str] = FEATURE_COLUMNS_V8 + TRANSLITERATION_FEATURE_COLS
+
 #: Alias for the current recommended full feature set.
-FEATURE_COLUMNS_FULL: list[str] = FEATURE_COLUMNS_V5
+FEATURE_COLUMNS_FULL: list[str] = FEATURE_COLUMNS_V9
 
 
 def _name_length_diff(a: str, b: str) -> float:

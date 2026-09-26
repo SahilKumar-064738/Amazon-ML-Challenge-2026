@@ -289,8 +289,73 @@ FEATURE_COLS_V5: tuple[str, ...] = FEATURE_COLS_V4 + (
     "n_channels_agreeing",
 )
 
+#: V6 = V5 + 15 difference features (55 total).
+FEATURE_COLS_V6: tuple[str, ...] = FEATURE_COLS_V5 + (
+    "name_common_token_count",
+    "name_s1_only_token_count",
+    "name_cand_only_token_count",
+    "name_token_difference_ratio",
+    "name_diff_token_sim",
+    "addr_common_token_count",
+    "addr_s1_only_token_count",
+    "addr_cand_only_token_count",
+    "numeric_common_count",
+    "numeric_s1_only_count",
+    "numeric_cand_only_count",
+    "numeric_overlap_ratio",
+    "numeric_conflict",
+    "numeric_set_equal",
+    "numeric_rel_diff",
+)
+
+#: V7 = V6 + 16 margin/ambiguity features (71 total).
+FEATURE_COLS_V7: tuple[str, ...] = FEATURE_COLS_V6 + (
+    "candidate_rank",
+    "top_candidate_score",
+    "second_candidate_score",
+    "top1_top2_margin",
+    "score_margin_vs_other",
+    "score_gap_to_next",
+    "score_gap_to_top",
+    "relative_margin",
+    "name_sim_margin",
+    "addr_sim_margin",
+    "candidate_count",
+    "n_near_ties",
+    "n_strong_candidates",
+    "candidates_within_01_of_top",
+    "competition_density",
+    "is_ambiguous_candidate_set",
+)
+
+#: V8 = V7 + 10 RapidFuzz features (81 total).
+FEATURE_COLS_V8: tuple[str, ...] = FEATURE_COLS_V7 + (
+    "name_fuzz_ratio",
+    "name_partial_ratio",
+    "name_key_ratio",
+    "name_key_partial_ratio",
+    "name_key_jaro_winkler",
+    "addr_fuzz_ratio",
+    "addr_partial_ratio",
+    "addr_token_sort_ratio",
+    "addr_token_set_ratio",
+    "addr_diff_token_sim",
+)
+
+#: V9 = V8 + 8 transliteration features (89 total).
+FEATURE_COLS_V9: tuple[str, ...] = FEATURE_COLS_V8 + (
+    "translit_token_mapped_count",
+    "translit_token_mapped_ratio",
+    "translit_name_fuzz_ratio",
+    "translit_name_token_sort_ratio",
+    "translit_name_token_set_ratio",
+    "translit_similarity_gain",
+    "translit_addr_mapped_count",
+    "translit_addr_fuzz_ratio",
+)
+
 #: Alias for the current recommended full feature set for experiments.
-FEATURE_COLS_FULL: tuple[str, ...] = FEATURE_COLS_V5
+FEATURE_COLS_FULL: tuple[str, ...] = FEATURE_COLS_V9
 
 
 def filter_pairs_by_entities(
