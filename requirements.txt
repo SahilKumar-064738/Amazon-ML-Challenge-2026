@@ -1,0 +1,47 @@
+# ============================================================
+# Combined Pipeline Requirements
+# Business Entity Resolution: Preprocessing + Matching
+# Verified working on Ubuntu 22.04 / Python 3.10+
+# ============================================================
+
+# ---------------------------------------------------------------------------
+# Core data processing (shared by both stages)
+# ---------------------------------------------------------------------------
+pandas>=2.0.0,<3.0
+numpy>=1.24.0,<2.0
+
+# ---------------------------------------------------------------------------
+# Preprocessing (MLnNor) dependencies
+# ---------------------------------------------------------------------------
+# pandas and numpy above cover all preprocessing needs.
+# scipy and scikit-learn are needed by matching/src/matching.py prototype
+# (not the production path) but listed here for completeness.
+
+# ---------------------------------------------------------------------------
+# Matching (MLnAWS) dependencies
+# ---------------------------------------------------------------------------
+scikit-learn>=1.3.0
+rapidfuzz>=3.0.0
+lightgbm>=4.0.0
+
+# BM25 retrieval — Apache 2.0 license, pure-Python, no GPU/PyTorch dependency
+rank-bm25==0.2.2
+
+# Sparse matrix operations (used by preprocessing/src/matching.py and blocking)
+scipy>=1.11.0
+
+# ---------------------------------------------------------------------------
+# Testing
+# ---------------------------------------------------------------------------
+pytest>=7.4
+pytest-timeout>=2.1
+
+# ---------------------------------------------------------------------------
+# NOT included (intentionally excluded):
+#   boto3, sagemaker — AWS/SageMaker execution not required for GCP/local run
+#   faiss-cpu        — optional; install manually if FAISS blocking is needed:
+#                        pip install faiss-cpu>=1.7.4
+#   sentence-transformers — optional; install manually if FAISS semantic
+#                           blocking is needed:
+#                        pip install sentence-transformers>=2.2.2
+# ---------------------------------------------------------------------------
