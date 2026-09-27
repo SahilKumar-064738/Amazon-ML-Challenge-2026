@@ -336,7 +336,9 @@ def run_blocking(s1_df: pd.DataFrame,
                  top_k: int,
                  label: str = "",
                  skip_bm25: bool = False,
-                 skip_faiss: bool = True) -> tuple[pd.DataFrame, dict]:
+                 skip_faiss: bool = True,
+                 chunk_size: int = 20_000,
+                 corpus_block_size: int = 250_000) -> tuple[pd.DataFrame, dict]:
     """
     Run the master retrieval pipeline: Exact Match + Multi-View TF-IDF + FAISS + BM25, then fuse.
 
@@ -345,6 +347,12 @@ def run_blocking(s1_df: pd.DataFrame,
     skip_faiss : bool
         When True (default) FAISS is not executed, preserving the existing
         baseline behaviour.  Set to False only when --enable-faiss is passed.
+    chunk_size : int
+        S1 query chunk size for TF-IDF 2D blocking (forwarded from --chunk-size).
+        Smaller values reduce peak memory at the cost of more iterations.
+    corpus_block_size : int
+        Corpus block size for TF-IDF 2D blocking (forwarded from --corpus-block-size).
+        Smaller values reduce peak memory per similarity block.
 
     Returns (results_df, candidates_by_s1 dict).
     """
@@ -365,13 +373,20 @@ def run_blocking(s1_df: pd.DataFrame,
         exact_df = pd.DataFrame()
         
     # ── 2. MULTI-VIEW TF-IDF ──────────────
-    print(f"  [{label}] Multi-View TF-IDF (top_k={top_k}) ...")
+    print(
+        f"  [{label}] Multi-View TF-IDF (top_k={top_k}, "
+        f"chunk={chunk_size:,}, corpus_block={corpus_block_size:,}) ..."
+    )
     try:
         from src.blocking_multiview import search_multiview_candidates
-        # We assume vectorizers are now a dict of fitted vectorizers {"name": vec, "address": vec, "combined": vec}
-        # In a real run we pass chunk_size and corpus_block_size from ARGS down to scalable_search, 
-        # but for simplicity we rely on the function defaults or modify it to accept kwargs.
-        mv_df = search_multiview_candidates(s1_df, s2s3_df, vectorizers, top_k=top_k)
+        mv_df = search_multiview_candidates(
+            s1_df,
+            s2s3_df,
+            vectorizers,
+            top_k=top_k,
+            chunk_size=chunk_size,
+            corpus_block_size=corpus_block_size,
+        )
         print(f"    Multi-View TF-IDF pairs: {len(mv_df)}")
     except ImportError:
         print(f"    Multi-view skipped (module missing).")
@@ -416,6 +431,10 @@ def run_blocking(s1_df: pd.DataFrame,
         try:
             bm25_df = search_candidates_bm25(s1_df, s2s3_df, top_k=top_k)
             print(f"    BM25 pairs: {len(bm25_df)}")
+            # search_candidates_bm25 returns after the BM25Index goes out of scope
+            # inside the function, but force a GC here to reclaim the tokenised
+            # corpus (~5–10 GB Python list of lists) before fusion.
+            import gc as _gc; _gc.collect()
         except Exception as exc:
             print(f"  [{label}] BM25 failed ({exc}).")
 
@@ -682,6 +701,8 @@ def main() -> None:
                 top_k=TOP_K, label="TRAIN",
                 skip_bm25=ARGS.skip_bm25,
                 skip_faiss=not ARGS.enable_faiss,
+                chunk_size=ARGS.chunk_size,
+                corpus_block_size=ARGS.corpus_block_size,
             )
             # Persist
             train_results_df.to_csv(CKPT_TRAIN_RESULTS, sep="\t", index=False)
@@ -1045,6 +1066,8 @@ def main() -> None:
             top_k=TOP_K, label="TEST",
             skip_bm25=ARGS.skip_bm25,
             skip_faiss=not ARGS.enable_faiss,
+            chunk_size=ARGS.chunk_size,
+            corpus_block_size=ARGS.corpus_block_size,
         )
         test_results_df.to_csv(CKPT_TEST_RESULTS, sep="\t", index=False)
         write_candidate_pairs(test_candidates, CKPT_TEST_CAND)
